@@ -60,7 +60,7 @@ def interpolate_great_circle(lat1: float, lon1: float, lat2: float, lon2: float,
     
     # If points are essentially the same, return starting point
     if delta < 1e-10:
-        return lat1, lon1
+        return degrees(lat1), degrees(lon1)
     
     # Interpolation using spherical trigonometry
     A = sin((1 - fraction) * delta) / sin(delta)
@@ -92,39 +92,41 @@ def interpolate_altitude(alt1: float, alt2: float, fraction: float) -> float:
 
 
 def fill_trajectory_gaps(df: pd.DataFrame, max_gap_seconds: int = 300,
+                         min_gap_seconds: int = 10,
                          points_per_interval: int = 10) -> pd.DataFrame:
     """
     Fill gaps in a flight trajectory using great-circle interpolation.
-    
+
     Args:
         df: DataFrame with columns: time, latitude, longitude, baro_altitude
             (must be sorted by time)
         max_gap_seconds: Maximum gap to interpolate (gaps larger are left as-is)
+        min_gap_seconds: Minimum gap to interpolate (smaller gaps are left as-is)
         points_per_interval: Number of interpolated points to add per interval
-    
+
     Returns:
         DataFrame with interpolated points inserted
     """
     if df.empty or len(df) < 2:
         return df
-    
+
     # Convert Unix timestamps to datetime if needed
     if df['time'].dtype == 'int64':
         df = df.copy()
         df['time'] = pd.to_datetime(df['time'], unit='s')
-    
+
     result = []
     result.append(df.iloc[0])
-    
+
     for i in range(len(df) - 1):
         current = df.iloc[i]
         next_point = df.iloc[i + 1]
-        
+
         # Calculate time gap
         time_diff = (next_point['time'] - current['time']).total_seconds()
-        
-        # If gap is too large or no gap, just add the next point
-        if time_diff <= 0 or time_diff > max_gap_seconds:
+
+        # Only interpolate gaps within [min_gap_seconds, max_gap_seconds]
+        if time_diff <= 0 or time_diff < min_gap_seconds or time_diff > max_gap_seconds:
             result.append(next_point)
             continue
         
