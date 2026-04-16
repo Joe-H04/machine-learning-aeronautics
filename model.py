@@ -117,35 +117,43 @@ class ConstantVelocityKalmanFilter:
         self.covariance = (np.eye(6) - K @ H) @ self.covariance
     
     def filter_trajectory(self, timestamps: np.ndarray, positions: np.ndarray,
-                         altitudes: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                         altitudes: np.ndarray,
+                         observed: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Filter a complete trajectory.
-        
+
         Args:
             timestamps: Array of timestamps (seconds from start)
             positions: Nx2 array of [lat, lon] positions
             altitudes: Array of altitudes
-        
+            observed: Boolean mask — True for real observations, False for gap points
+                      (gap points are predict-only, no measurement update).
+                      If None, all points are treated as observed.
+
         Returns:
             Filtered (latitudes, longitudes, altitudes)
         """
+        if observed is None:
+            observed = np.ones(len(timestamps), dtype=bool)
+
         filtered_lats = []
         filtered_lons = []
         filtered_alts = []
-        
+
         for i, (lat, lon, alt) in enumerate(zip(positions[:, 0], positions[:, 1], altitudes)):
             if i == 0:
                 self.initialize_state(lat, lon, alt)
             else:
                 dt = timestamps[i] - timestamps[i - 1]
                 self.predict(dt)
-            
-            self.update(np.array([lat, lon, alt]))
-            
+
+            if observed[i]:
+                self.update(np.array([lat, lon, alt]))
+
             filtered_lats.append(self.state[0])
             filtered_lons.append(self.state[1])
             filtered_alts.append(self.state[2])
-        
+
         return np.array(filtered_lats), np.array(filtered_lons), np.array(filtered_alts)
 
 
@@ -169,33 +177,41 @@ class KalmanSmoother:
         self.measurement_noise = measurement_noise
     
     def smooth_trajectory(self, timestamps: np.ndarray, positions: np.ndarray,
-                         altitudes: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                         altitudes: np.ndarray,
+                         observed: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Apply smoother to trajectory.
-        
+
         Args:
             timestamps: Array of timestamps (seconds from start)
             positions: Nx2 array of [lat, lon] positions
             altitudes: Array of altitudes
-        
+            observed: Boolean mask — True for real observations, False for gap points
+                      (gap points are predict-only, no measurement update).
+                      If None, all points are treated as observed.
+
         Returns:
             Smoothed (latitudes, longitudes, altitudes)
         """
         n = len(timestamps)
-        
+
+        if observed is None:
+            observed = np.ones(n, dtype=bool)
+
         # Forward pass: standard Kalman filter
         states_fwd = []
         covs_fwd = []
-        
+
         for i, (lat, lon, alt) in enumerate(zip(positions[:, 0], positions[:, 1], altitudes)):
             if i == 0:
                 self.kf.initialize_state(lat, lon, alt)
             else:
                 dt = timestamps[i] - timestamps[i - 1]
                 self.kf.predict(dt)
-            
-            self.kf.update(np.array([lat, lon, alt]))
-            
+
+            if observed[i]:
+                self.kf.update(np.array([lat, lon, alt]))
+
             states_fwd.append(self.kf.state.copy())
             covs_fwd.append(self.kf.covariance.copy())
         
@@ -393,75 +409,98 @@ class FusionTrajectoryModel:
             before_*: Trajectory data before gap
             after_*: Trajectory data after gap
             gap_times: Times to fill
-            method: 'kalman', 'smoother', or 'lstm'
+            method: 'kalman' or 'smoother' (both always run kalman; 'smoother' also runs RTS smoother)
         
         Returns:
             Dict with reconstruction from each available method
         """
         results = {}
-        
-        # Combine context from before and after
+
+        # Combine context from before and after, with placeholders for gap
         combined_times = np.concatenate([before_times, gap_times, after_times])
-        combined_lats = np.concatenate([before_lat, np.zeros_like(gap_times), after_lat])
-        combined_lons = np.concatenate([before_lon, np.zeros_like(gap_times), after_lon])
-        combined_alts = np.concatenate([before_alt, np.zeros_like(gap_times), after_alt])
-        
+        combined_lats = np.concatenate([before_lat, np.zeros(len(gap_times)), after_lat])
+        combined_lons = np.concatenate([before_lon, np.zeros(len(gap_times)), after_lon])
+        combined_alts = np.concatenate([before_alt, np.zeros(len(gap_times)), after_alt])
+
         combined_positions = np.column_stack([combined_lats, combined_lons])
-        
+
+        # Build observation mask: True for real data, False for gap points
+        observed = np.concatenate([
+            np.ones(len(before_times), dtype=bool),
+            np.zeros(len(gap_times), dtype=bool),
+            np.ones(len(after_times), dtype=bool),
+        ])
+
         # Normalize times to seconds from start
-        combined_times = (combined_times - combined_times[0]).total_seconds()
-        
+        combined_times = (combined_times - combined_times[0]).astype(float)
+
+        gap_idx = len(before_times)
+        gap_len = len(gap_times)
+
         # Kalman filter
         try:
             filtered_lats, filtered_lons, filtered_alts = self.kf.filter_trajectory(
-                combined_times, combined_positions, combined_alts
+                combined_times, combined_positions, combined_alts, observed
             )
-            gap_idx = len(before_times)
             results['kalman'] = (
-                filtered_lats[gap_idx:gap_idx + len(gap_times)],
-                filtered_lons[gap_idx:gap_idx + len(gap_times)],
-                filtered_alts[gap_idx:gap_idx + len(gap_times)]
+                filtered_lats[gap_idx:gap_idx + gap_len],
+                filtered_lons[gap_idx:gap_idx + gap_len],
+                filtered_alts[gap_idx:gap_idx + gap_len],
             )
         except Exception as e:
             print(f"Kalman filter error: {e}")
-        
+
         # Kalman smoother
-        if method == 'smoother':
+        if method in ('smoother', 'kalman'):
             try:
                 smoothed_lats, smoothed_lons, smoothed_alts = self.smoother.smooth_trajectory(
-                    combined_times, combined_positions, combined_alts
+                    combined_times, combined_positions, combined_alts, observed
                 )
-                gap_idx = len(before_times)
                 results['smoother'] = (
-                    smoothed_lats[gap_idx:gap_idx + len(gap_times)],
-                    smoothed_lons[gap_idx:gap_idx + len(gap_times)],
-                    smoothed_alts[gap_idx:gap_idx + len(gap_times)]
+                    smoothed_lats[gap_idx:gap_idx + gap_len],
+                    smoothed_lons[gap_idx:gap_idx + gap_len],
+                    smoothed_alts[gap_idx:gap_idx + gap_len],
                 )
             except Exception as e:
                 print(f"Smoother error: {e}")
-        
+
         return results
     
     def evaluate_reconstruction(self, true_positions: np.ndarray,
-                              predicted_positions: np.ndarray) -> TrajectoryMetrics:
-        """Evaluate reconstruction quality against ground truth."""
+                              predicted_positions: np.ndarray,
+                              true_alt: Optional[np.ndarray] = None,
+                              predicted_alt: Optional[np.ndarray] = None) -> TrajectoryMetrics:
+        """
+        Evaluate reconstruction quality against ground truth.
+
+        Args:
+            true_positions: Nx2 array of [lat, lon] ground truth
+            predicted_positions: Nx2 array of [lat, lon] predictions
+            true_alt: Array of ground truth altitudes (optional)
+            predicted_alt: Array of predicted altitudes (optional)
+        """
         lat_error = np.mean(np.abs(true_positions[:, 0] - predicted_positions[:, 0]))
         lon_error = np.mean(np.abs(true_positions[:, 1] - predicted_positions[:, 1]))
-        
+
         # Simple Euclidean distance error (not great-circle, but for comparison)
-        dist_error = np.mean(np.linalg.norm(
+        dist_error = np.sqrt(np.mean(np.linalg.norm(
             true_positions - predicted_positions, axis=1
-        ))
-        
+        ) ** 2))
+
+        # Altitude error
+        alt_error = 0.0
+        if true_alt is not None and predicted_alt is not None:
+            alt_error = np.mean(np.abs(true_alt - predicted_alt))
+
         # Velocity smoothness (lower is smoother)
         velocities = np.diff(predicted_positions, axis=0)
         velocity_changes = np.diff(velocities, axis=0)
-        smoothness = np.mean(np.linalg.norm(velocity_changes, axis=1))
-        
+        smoothness = np.mean(np.linalg.norm(velocity_changes, axis=1)) if len(velocity_changes) > 0 else 0.0
+
         return TrajectoryMetrics(
             mae_lat=lat_error,
             mae_lon=lon_error,
-            mae_alt=0.0,  # Would need altitude data
+            mae_alt=alt_error,
             rmse_position=dist_error,
             velocity_smoothness=smoothness
         )
